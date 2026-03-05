@@ -1,121 +1,188 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/rand"
 	"net/http"
+	"os"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// hardcoded secrets (bad practice #1)
-var DB_PASSWORD = "uiodgf798psgf"
-var AWS_TOKEN = "jkabfjkasbfjaskbfjkas"
-var AWS_SECRET = "jk;asbfuioashf901!"
-
-// global mutable state (bad practice #2)
-var requestCount int
-var lastPokemon map[string]interface{}
-var cache map[string]interface{}
-
-// God struct that does everything (bad practice #3)
-type App struct {
-	Name     string
-	Version  string
-	Password string
-	Token    string
-	Secret   string
-	Count    int
-	Data     map[string]interface{}
-	Client   *http.Client
-	Rand     *rand.Rand
-	Time     time.Time
-	Running  bool
-	Debug    bool
+// Config holds application configuration loaded from environment variables.
+type Config struct {
+	DBPassword string
+	AWSToken   string
+	AWSSecret  string
 }
 
-func main() {
-	// no structured initialization (bad practice #4)
-	cache = make(map[string]interface{})
-
-	fmt.Println("Starting server on :8080 password=" + DB_PASSWORD + " token=" + AWS_TOKEN)
-
-	// single handler for everything (bad practice #5)
-	http.HandleFunc("/", handleEverything)
-	http.HandleFunc("/pokemon", handleEverything)
-	http.HandleFunc("/hello", handleEverything)
-	http.HandleFunc("/random", handleEverything)
-
-	// ignoring error (bad practice #6)
-	http.ListenAndServe(":8080", nil)
+// Pokemon holds the relevant fields from the PokeAPI response.
+type Pokemon struct {
+	Name           string `json:"name"`
+	BaseExperience int    `json:"base_experience"`
+	Weight         int    `json:"weight"`
+	Height         int    `json:"height"`
 }
 
-// God function that handles all routes (bad practice #7)
-func handleEverything(w http.ResponseWriter, r *http.Request) {
-	requestCount++
+// PokemonResponse is the JSON structure returned to clients.
+type PokemonResponse struct {
+	RequestCount   int64  `json:"request_count"`
+	Pokemon        string `json:"pokemon"`
+	BaseExperience int    `json:"base_experience"`
+	Weight         int    `json:"weight"`
+	Height         int    `json:"height"`
+}
 
-	// no context, no timeout (bad practice #8)
-	client := &http.Client{}
+// Server holds all dependencies needed to serve requests.
+type Server struct {
+	config       Config
+	cache        map[string]Pokemon
+	cacheMu      sync.RWMutex
+	client       *http.Client
+	requestCount atomic.Int64
+	rng          *rand.Rand
+	rngMu        sync.Mutex
+}
 
-	var id int
-	if r.URL.Path == "/random" || r.URL.Path == "/" {
-		// weak randomness with time seed every call (bad practice #9)
-		rand.Seed(time.Now().UnixNano())
-		id = rand.Intn(151) + 1
-	} else {
-		q := r.URL.Query().Get("id")
-		if q == "" {
-			id = 1
-		} else {
-			// no validation (bad practice #10)
-			id, _ = strconv.Atoi(q)
-		}
+func loadConfig() (Config, error) {
+	cfg := Config{
+		DBPassword: os.Getenv("DB_PASSWORD"),
+		AWSToken:   os.Getenv("AWS_TOKEN"),
+		AWSSecret:  os.Getenv("AWS_SECRET"),
+	}
+	if cfg.DBPassword == "" || cfg.AWSToken == "" || cfg.AWSSecret == "" {
+		return Config{}, fmt.Errorf("missing required environment variables: DB_PASSWORD, AWS_TOKEN, AWS_SECRET")
+	}
+	return cfg, nil
+}
+
+func newServer(cfg Config) *Server {
+	return &Server{
+		config: cfg,
+		cache:  make(map[string]Pokemon),
+		client: &http.Client{Timeout: 10 * time.Second},
+		rng:    rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+}
+
+func (s *Server) getPokemon(ctx context.Context, id int) (Pokemon, error) {
+	key := strconv.Itoa(id)
+
+	s.cacheMu.RLock()
+	if p, ok := s.cache[key]; ok {
+		s.cacheMu.RUnlock()
+		return p, nil
+	}
+	s.cacheMu.RUnlock()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://pokeapi.co/api/v2/pokemon/"+key, nil)
+	if err != nil {
+		return Pokemon{}, fmt.Errorf("creating request: %w", err)
 	}
 
-	// check cache with no expiry, no mutex (bad practice #11)
-	key := strconv.Itoa(id)
-	if cached, ok := cache[key]; ok {
-		fmt.Println("cache hit for " + key + " secret=" + AWS_SECRET)
-		lastPokemon = cached.(map[string]interface{})
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(lastPokemon)
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return Pokemon{}, fmt.Errorf("fetching pokemon: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return Pokemon{}, fmt.Errorf("unexpected status: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return Pokemon{}, fmt.Errorf("reading body: %w", err)
+	}
+
+	var pokemon Pokemon
+	if err := json.Unmarshal(body, &pokemon); err != nil {
+		return Pokemon{}, fmt.Errorf("parsing response: %w", err)
+	}
+
+	s.cacheMu.Lock()
+	s.cache[key] = pokemon
+	s.cacheMu.Unlock()
+
+	return pokemon, nil
+}
+
+func (s *Server) servePokemon(w http.ResponseWriter, r *http.Request, id int) {
+	count := s.requestCount.Add(1)
+
+	pokemon, err := s.getPokemon(r.Context(), id)
+	if err != nil {
+		http.Error(w, "failed to fetch pokemon", http.StatusInternalServerError)
+		fmt.Fprintf(os.Stderr, "error fetching pokemon %d: %v\n", id, err)
 		return
 	}
 
-	url := "https://pokeapi.co/api/v2/pokemon/" + key
-	resp, _ := client.Get(url) // ignoring error (bad practice #12)
+	resp := PokemonResponse{
+		RequestCount:   count,
+		Pokemon:        pokemon.Name,
+		BaseExperience: pokemon.BaseExperience,
+		Weight:         pokemon.Weight,
+		Height:         pokemon.Height,
+	}
 
-	// no nil check on resp (bad practice #13)
-	body, _ := ioutil.ReadAll(resp.Body)
-	resp.Body.Close()
-
-	var data map[string]interface{}
-	json.Unmarshal(body, &data) // ignoring error (bad practice #14)
-
-	// storing massive raw API response in cache with no size limit (bad practice #15)
-	cache[key] = data
-	lastPokemon = data
-
-	// building response by manually constructing JSON string (bad practice #16)
-	name := fmt.Sprintf("%v", data["name"])
-	baseExp := fmt.Sprintf("%v", data["base_experience"])
-	weight := fmt.Sprintf("%v", data["weight"])
-	height := fmt.Sprintf("%v", data["height"])
-
-	jsonStr := `{"hello":"world","request_count":` + strconv.Itoa(requestCount) +
-		`,"pokemon":"` + name + `","base_experience":` + baseExp +
-		`,"weight":` + weight + `,"height":` + height +
-		`,"fetched_by":"` + DB_PASSWORD + `"}`
-
-	// leaking password in response (bad practice #17)
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Secret-Token", AWS_TOKEN) // leaking token in header (bad practice #18)
-	fmt.Fprintln(w, jsonStr)
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		fmt.Fprintf(os.Stderr, "error encoding response: %v\n", err)
+	}
 
-	// sleep with no reason (bad practice #19)
-	time.Sleep(100 * time.Millisecond)
+	fmt.Printf("Served pokemon #%d total_requests=%d\n", id, count)
+}
 
-	fmt.Println("Served pokemon #" + key + " total_requests=" + strconv.Itoa(requestCount))
+func (s *Server) handlePokemon(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query().Get("id")
+	var id int
+	if q == "" {
+		id = 1
+	} else {
+		var err error
+		id, err = strconv.Atoi(q)
+		if err != nil || id < 1 || id > 898 {
+			http.Error(w, "invalid id: must be an integer between 1 and 898", http.StatusBadRequest)
+			return
+		}
+	}
+	s.servePokemon(w, r, id)
+}
+
+func (s *Server) handleRandom(w http.ResponseWriter, r *http.Request) {
+	s.rngMu.Lock()
+	id := s.rng.Intn(151) + 1
+	s.rngMu.Unlock()
+	s.servePokemon(w, r, id)
+}
+
+func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"hello": "world"})
+}
+
+func main() {
+	cfg, err := loadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "configuration error: %v\n", err)
+		os.Exit(1)
+	}
+
+	s := newServer(cfg)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/pokemon", s.handlePokemon)
+	mux.HandleFunc("/random", s.handleRandom)
+	mux.HandleFunc("/hello", s.handleHello)
+
+	fmt.Println("Starting server on :8080")
+	if err := http.ListenAndServe(":8080", mux); err != nil {
+		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
+		os.Exit(1)
+	}
 }
