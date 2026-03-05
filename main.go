@@ -19,6 +19,8 @@ type Config struct {
 	DBPassword string
 	AWSToken   string
 	AWSSecret  string
+	EnableDB   bool
+	EnableAWS  bool
 }
 
 // Pokemon holds the relevant fields from the PokeAPI response.
@@ -54,9 +56,14 @@ func loadConfig() (Config, error) {
 		DBPassword: os.Getenv("DB_PASSWORD"),
 		AWSToken:   os.Getenv("AWS_TOKEN"),
 		AWSSecret:  os.Getenv("AWS_SECRET"),
+		EnableDB:   os.Getenv("ENABLE_DB") == "true",
+		EnableAWS:  os.Getenv("ENABLE_AWS") == "true",
 	}
-	if cfg.DBPassword == "" || cfg.AWSToken == "" || cfg.AWSSecret == "" {
-		return Config{}, fmt.Errorf("missing required environment variables: DB_PASSWORD, AWS_TOKEN, AWS_SECRET")
+	if cfg.EnableDB && cfg.DBPassword == "" {
+		return Config{}, fmt.Errorf("missing required environment variable: DB_PASSWORD")
+	}
+	if cfg.EnableAWS && (cfg.AWSToken == "" || cfg.AWSSecret == "") {
+		return Config{}, fmt.Errorf("missing required environment variables: AWS_TOKEN, AWS_SECRET")
 	}
 	return cfg, nil
 }
@@ -163,7 +170,10 @@ func (s *Server) handleRandom(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"hello": "world"})
+	if err := json.NewEncoder(w).Encode(map[string]string{"hello": "world"}); err != nil {
+		fmt.Fprintf(os.Stderr, "error encoding response: %v\n", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+	}
 }
 
 func main() {
@@ -180,8 +190,16 @@ func main() {
 	mux.HandleFunc("/random", s.handleRandom)
 	mux.HandleFunc("/hello", s.handleHello)
 
+	server := &http.Server{
+		Addr:         ":8080",
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
 	fmt.Println("Starting server on :8080")
-	if err := http.ListenAndServe(":8080", mux); err != nil {
+	if err := server.ListenAndServe(); err != nil {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 		os.Exit(1)
 	}

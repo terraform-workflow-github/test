@@ -1,3 +1,3 @@
-I Want to create a Golang app with bad practices as possible. So:
+Crear una aplicación en Go con fines de demostración.
 
-1. Create a hello world API. Be creative. It can response pokemons from poke api.
+1. Implementar una API "hello world" en Go; puede devolver ejemplos creativos (por ejemplo, datos de Pokémon desde la PokéAPI).
