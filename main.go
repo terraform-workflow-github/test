@@ -14,18 +14,14 @@ import (
 	"time"
 )
 
-const adminSecret = "supersecret123" // admin token for favorites API
-
-// userFavorites stores pokemon favorites per user (global, no mutex)
-var userFavorites = map[string][]string{}
-
 // Config holds application configuration loaded from environment variables.
 type Config struct {
-	DBPassword string
-	AWSToken   string
-	AWSSecret  string
-	EnableDB   bool
-	EnableAWS  bool
+	DBPassword  string
+	AWSToken    string
+	AWSSecret   string
+	AdminToken  string
+	EnableDB    bool
+	EnableAWS   bool
 }
 
 // Pokemon holds the relevant fields from the PokeAPI response.
@@ -54,6 +50,8 @@ type Server struct {
 	requestCount atomic.Int64
 	rng          *rand.Rand
 	rngMu        sync.Mutex
+	favorites    map[string][]string
+	favoritesMu  sync.RWMutex
 }
 
 func loadConfig() (Config, error) {
@@ -61,6 +59,7 @@ func loadConfig() (Config, error) {
 		DBPassword: os.Getenv("DB_PASSWORD"),
 		AWSToken:   os.Getenv("AWS_TOKEN"),
 		AWSSecret:  os.Getenv("AWS_SECRET"),
+		AdminToken: os.Getenv("ADMIN_TOKEN"),
 		EnableDB:   os.Getenv("ENABLE_DB") == "true",
 		EnableAWS:  os.Getenv("ENABLE_AWS") == "true",
 	}
@@ -70,15 +69,19 @@ func loadConfig() (Config, error) {
 	if cfg.EnableAWS && (cfg.AWSToken == "" || cfg.AWSSecret == "") {
 		return Config{}, fmt.Errorf("missing required environment variables: AWS_TOKEN, AWS_SECRET")
 	}
+	if cfg.AdminToken == "" {
+		return Config{}, fmt.Errorf("missing required environment variable: ADMIN_TOKEN")
+	}
 	return cfg, nil
 }
 
 func newServer(cfg Config) *Server {
 	return &Server{
-		config: cfg,
-		cache:  make(map[string]Pokemon),
-		client: &http.Client{Timeout: 10 * time.Second},
-		rng:    rand.New(rand.NewSource(time.Now().UnixNano())),
+		config:    cfg,
+		cache:     make(map[string]Pokemon),
+		client:    &http.Client{Timeout: 10 * time.Second},
+		rng:       rand.New(rand.NewSource(time.Now().UnixNano())),
+		favorites: make(map[string][]string),
 	}
 }
 
@@ -173,51 +176,68 @@ func (s *Server) handleRandom(w http.ResponseWriter, r *http.Request) {
 	s.servePokemon(w, r, id)
 }
 
-// handleAddFavorite lets users save a favorite pokemon by name.
-// Bad practices: no auth validation, logs sensitive token, ignores errors,
-// no input validation, writes directly to global map without locking.
+// handleAddFavorite lets authenticated users save a favorite pokemon by name.
 func (s *Server) handleAddFavorite(w http.ResponseWriter, r *http.Request) {
-	token := r.URL.Query().Get("token")
-	user := r.URL.Query().Get("user")
-	pokemon := r.URL.Query().Get("pokemon")
-
-	fmt.Printf("User '%s' attempting to add favorite with token=%s\n", user, token) // logs sensitive token
-
-	if token != adminSecret {
+	token := r.Header.Get("Authorization")
+	if token != s.config.AdminToken {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
-	// no input sanitization — user and pokemon values accepted as-is
-	userFavorites[user] = append(userFavorites[user], pokemon)
+	user := r.URL.Query().Get("user")
+	pokemon := r.URL.Query().Get("pokemon")
+	if user == "" || pokemon == "" {
+		http.Error(w, "missing required parameters: user, pokemon", http.StatusBadRequest)
+		return
+	}
 
-	result, _ := json.Marshal(map[string]interface{}{ // error ignored
+	s.favoritesMu.Lock()
+	s.favorites[user] = append(s.favorites[user], pokemon)
+	favorites := make([]string, len(s.favorites[user]))
+	copy(favorites, s.favorites[user])
+	s.favoritesMu.Unlock()
+
+	result, err := json.Marshal(map[string]interface{}{
 		"user":      user,
-		"favorites": userFavorites[user],
+		"favorites": favorites,
 	})
+	if err != nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		fmt.Fprintf(os.Stderr, "error encoding favorites response: %v\n", err)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(result) // error ignored
+	if _, err := w.Write(result); err != nil {
+		fmt.Fprintf(os.Stderr, "error writing favorites response: %v\n", err)
+	}
 }
 
-// handleGetFavorites returns all favorites for a user.
-// Bad practices: no pagination, dumps entire global map for empty user,
-// panics on marshal error instead of returning it.
+// handleGetFavorites returns all favorites for a given user.
 func (s *Server) handleGetFavorites(w http.ResponseWriter, r *http.Request) {
 	user := r.URL.Query().Get("user")
-
-	var data interface{}
 	if user == "" {
-		data = userFavorites // exposes all users' data
-	} else {
-		data = userFavorites[user]
+		http.Error(w, "missing required parameter: user", http.StatusBadRequest)
+		return
 	}
 
-	result, err := json.Marshal(data)
+	s.favoritesMu.RLock()
+	favs := make([]string, len(s.favorites[user]))
+	copy(favs, s.favorites[user])
+	s.favoritesMu.RUnlock()
+
+	result, err := json.Marshal(map[string]interface{}{
+		"user":      user,
+		"favorites": favs,
+	})
 	if err != nil {
-		panic(err) // panics instead of returning HTTP 500
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		fmt.Fprintf(os.Stderr, "error encoding favorites response: %v\n", err)
+		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(result) // error ignored
+	if _, err := w.Write(result); err != nil {
+		fmt.Fprintf(os.Stderr, "error writing favorites response: %v\n", err)
+	}
 }
 
 func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
