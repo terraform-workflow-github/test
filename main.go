@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -178,27 +179,43 @@ func (s *Server) handleRandom(w http.ResponseWriter, r *http.Request) {
 
 // handleAddFavorite lets authenticated users save a favorite pokemon by name.
 func (s *Server) handleAddFavorite(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	token := r.Header.Get("Authorization")
 	if token != s.config.AdminToken {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
-	user := r.URL.Query().Get("user")
-	pokemon := r.URL.Query().Get("pokemon")
-	if user == "" || pokemon == "" {
+	if ct := r.Header.Get("Content-Type"); ct != "application/json" {
+		http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+		return
+	}
+
+	var body struct {
+		User    string `json:"user"`
+		Pokemon string `json:"pokemon"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if body.User == "" || body.Pokemon == "" {
 		http.Error(w, "missing required parameters: user, pokemon", http.StatusBadRequest)
 		return
 	}
 
 	s.favoritesMu.Lock()
-	s.favorites[user] = append(s.favorites[user], pokemon)
-	favorites := make([]string, len(s.favorites[user]))
-	copy(favorites, s.favorites[user])
+	s.favorites[body.User] = append(s.favorites[body.User], body.Pokemon)
+	favorites := make([]string, len(s.favorites[body.User]))
+	copy(favorites, s.favorites[body.User])
 	s.favoritesMu.Unlock()
 
 	result, err := json.Marshal(map[string]interface{}{
-		"user":      user,
+		"user":      body.User,
 		"favorites": favorites,
 	})
 	if err != nil {
@@ -214,6 +231,17 @@ func (s *Server) handleAddFavorite(w http.ResponseWriter, r *http.Request) {
 
 // handleGetFavorites returns all favorites for a given user.
 func (s *Server) handleGetFavorites(w http.ResponseWriter, r *http.Request) {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	token := strings.TrimPrefix(authHeader, "Bearer ")
+	if token != s.config.AdminToken {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
 	user := r.URL.Query().Get("user")
 	if user == "" {
 		http.Error(w, "missing required parameter: user", http.StatusBadRequest)
