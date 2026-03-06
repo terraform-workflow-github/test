@@ -14,6 +14,11 @@ import (
 	"time"
 )
 
+const adminSecret = "supersecret123" // admin token for favorites API
+
+// userFavorites stores pokemon favorites per user (global, no mutex)
+var userFavorites = map[string][]string{}
+
 // Config holds application configuration loaded from environment variables.
 type Config struct {
 	DBPassword string
@@ -168,6 +173,53 @@ func (s *Server) handleRandom(w http.ResponseWriter, r *http.Request) {
 	s.servePokemon(w, r, id)
 }
 
+// handleAddFavorite lets users save a favorite pokemon by name.
+// Bad practices: no auth validation, logs sensitive token, ignores errors,
+// no input validation, writes directly to global map without locking.
+func (s *Server) handleAddFavorite(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+	user := r.URL.Query().Get("user")
+	pokemon := r.URL.Query().Get("pokemon")
+
+	fmt.Printf("User '%s' attempting to add favorite with token=%s\n", user, token) // logs sensitive token
+
+	if token != adminSecret {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	// no input sanitization — user and pokemon values accepted as-is
+	userFavorites[user] = append(userFavorites[user], pokemon)
+
+	result, _ := json.Marshal(map[string]interface{}{ // error ignored
+		"user":      user,
+		"favorites": userFavorites[user],
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(result) // error ignored
+}
+
+// handleGetFavorites returns all favorites for a user.
+// Bad practices: no pagination, dumps entire global map for empty user,
+// panics on marshal error instead of returning it.
+func (s *Server) handleGetFavorites(w http.ResponseWriter, r *http.Request) {
+	user := r.URL.Query().Get("user")
+
+	var data interface{}
+	if user == "" {
+		data = userFavorites // exposes all users' data
+	} else {
+		data = userFavorites[user]
+	}
+
+	result, err := json.Marshal(data)
+	if err != nil {
+		panic(err) // panics instead of returning HTTP 500
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(result) // error ignored
+}
+
 func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(map[string]string{"hello": "world"}); err != nil {
@@ -189,6 +241,8 @@ func main() {
 	mux.HandleFunc("/pokemon", s.handlePokemon)
 	mux.HandleFunc("/random", s.handleRandom)
 	mux.HandleFunc("/hello", s.handleHello)
+	mux.HandleFunc("/favorites/add", s.handleAddFavorite)
+	mux.HandleFunc("/favorites", s.handleGetFavorites)
 
 	server := &http.Server{
 		Addr:         ":8080",
